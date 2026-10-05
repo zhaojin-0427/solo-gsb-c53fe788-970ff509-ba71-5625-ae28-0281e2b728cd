@@ -32,6 +32,16 @@
 > 候选图连通分量分别求解；搜索树上的每个节点用一个**单调性的位姿 LP 松弛**
 > （12 边形外逼近 + 位姿修正一阶线性化）提前剪枝——LP 不可行则任何超集都不
 > 可行；只有叶节点才做精确的 Gauss–Newton 全局位姿求解与掩膜光栅化校验。
+>
+> **多簇临时子集的 LP 变量空间。** 候选图整体连通、但完整集合不可行而进入
+> 子集搜索后，某个临时已选集合可能由**多个互不相连的连通分量**组成——例如
+> 同时含一个三片闭合环（A-B-C）和另一条独立接缝（D-E），而连接它们的桥接
+> 缝此刻尚未被选中。每个分量以各自的最小 ID 片段为锚点（锚点不设修正变量），
+> 因而各分量的修正变量个数不同（环 6 个、独立缝 3 个）。松弛对**所有分量的
+> 全部非锚点节点统一编号**到一个变量向量中，各分量的约束行只写自己的列，
+> 构成**块对角 LP**——等价于对各分量分别求解 LP 的合取，且行宽一致，不会把
+> 宽度不同的行堆进同一个数组（旧实现会抛
+> `ValueError: ... inhomogeneous shape` 导致接口 500）。
 
 ---
 
@@ -193,6 +203,75 @@ curl -s -X POST http://localhost:8000/assemblies \
 `overlap_pixels`（不适用时为 `null`）。淘汰接缝只出现在报告里，
 **不会出现在任何簇的渲染图中**。
 
+### 多簇子集搜索示例（闭环簇 + 独立接缝）
+
+这是修复前会让 `POST /assemblies` 返回 500 的场景：候选接缝图整体连通
+（A-B-C 与 D-E 由低分桥接缝 C-D 相连），A-B-C 构成一个几何自洽的三片
+**闭环**，但闭环弦 `bc` 掩膜重叠超限，完整集合不可行；搜索临时放下桥接缝
+时，已选集合同时含一个三片闭环簇和一条独立接缝（D-E），两簇修正变量个数
+不同。脚本生成该真实请求（5 张矩形透明 PNG、5 条接缝）并调用服务：
+
+```bash
+python examples/make_multicluster_example.py --call
+curl -s -X POST http://localhost:8000/assemblies \
+  -H 'Content-Type: application/json' \
+  --data @examples/multi_request.json | python -m json.tool
+```
+
+实际响应（`examples/multi_response.json`；服务正常返回 200，PNG 为真实
+Base64，下方截断展示）。搜索舍弃重叠超限的高分弦 `bc`（9 分），保留
+`ab+ac`（16 分）与桥链 `cd+de`（8 分），取到可行的最高总分 **24**，
+并诚实给出淘汰原因与实测重叠像素：
+
+```json
+{
+  "clusters": [
+    {
+      "cluster_id": 1,
+      "fragment_ids": ["A", "B", "C", "D", "E"],
+      "poses": [
+        {"fragment_id": "A", "theta": 0.0, "tx": 0.0,   "ty": 0.0,
+         "pair_residual_rms": 0.0, "pair_residual_max": 0.0},
+        {"fragment_id": "B", "theta": 0.0, "tx": 39.0,  "ty": 0.0,
+         "pair_residual_rms": 0.0, "pair_residual_max": 0.0},
+        {"fragment_id": "C", "theta": 0.0, "tx": 0.0,   "ty": 39.0,
+         "pair_residual_rms": 0.0, "pair_residual_max": 0.0},
+        {"fragment_id": "D", "theta": 0.0, "tx": 79.0,  "ty": 39.0,
+         "pair_residual_rms": 0.0, "pair_residual_max": 0.0},
+        {"fragment_id": "E", "theta": 0.0, "tx": 158.0, "ty": 39.0,
+         "pair_residual_rms": 0.0, "pair_residual_max": 0.0}
+      ],
+      "adopted_seams": [
+        {"id": "ab", "fragment_a": "A", "fragment_b": "B", "score": 8.0,
+         "pair_residual_max": 0.0, "loop_error": 0.0, "overlap_pixels": 40},
+        {"id": "ac", "fragment_a": "A", "fragment_b": "C", "score": 8.0,
+         "pair_residual_max": 0.0, "loop_error": 0.0, "overlap_pixels": 40},
+        {"id": "cd", "fragment_a": "C", "fragment_b": "D", "score": 1.0,
+         "pair_residual_max": 0.0, "loop_error": 0.0, "overlap_pixels": 40},
+        {"id": "de", "fragment_a": "D", "fragment_b": "E", "score": 7.0,
+         "pair_residual_max": 0.0, "loop_error": 0.0, "overlap_pixels": 0}
+      ],
+      "rejected_seams": [
+        {"id": "bc", "fragment_a": "B", "fragment_b": "C", "score": 9.0,
+         "reason": "mask_overlap_exceeds_limit",
+         "pair_residual_max": 0.2465, "loop_error": 0.2465,
+         "overlap_pixels": 40}
+      ],
+      "total_score": 24.0,
+      "image_base64": "iVBORw0KGgoAAAANSUhEUgAAANUAAABeCAYAAAC0N1GY...（透明 PNG）"
+    }
+  ],
+  "adopted_seam_ids": ["ab", "ac", "cd", "de"],
+  "rejected_seams": [
+    {"id": "bc", "reason": "mask_overlap_exceeds_limit", "...": "..."}
+  ],
+  "total_score": 24.0
+}
+```
+
+单簇闭环、纯生成树（无闭环）与完全孤立的片段仍走各自的正常路径
+（树只校掩膜重叠、孤立片段各自成簇）。
+
 ---
 
 ## 5. 模块结构
@@ -201,13 +280,13 @@ curl -s -X POST http://localhost:8000/assemblies \
 app/
   geometry.py    闭式刚体（旋转+平移）拟合、位姿复合/相对位姿
   posegraph.py   生成树初始化 + 全局 Gauss–Newton 位姿图求解（所有接缝同时拟合）
-  relax.py       位姿可行性的 LP 松弛（单调性、可靠剪枝）
+  relax.py       位姿可行性的 LP 松弛（单调性、可靠剪枝；多分量块对角变量空间）
   masks.py       alpha 掩膜、相对位姿下的实体重叠计数、透明 PNG 渲染
   assembler.py   解码/建模、可行性判定、分支限界精确全局选缝
   service.py     端到端编排：成簇、采用/淘汰归因、渲染与响应
   schemas.py     Pydantic 请求/响应模型
   main.py        FastAPI 应用（/health、/assemblies，422 处理）
-examples/        真实请求/响应生成脚本与产物
+examples/        真实请求/响应生成脚本与产物（含多簇闭环场景）
 tests/           API、几何、全局优化器（含对拍暴力枚举）与多片段闭环测试
 ```
 

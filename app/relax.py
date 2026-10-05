@@ -4,12 +4,24 @@ The exact question is: *does there exist a single set of global fragment
 poses for which every selected seam's point residuals, loop-closure error
 and (handled separately, non-linear) mask overlap stay within limits?*
 
-Pose corrections are linearised around the spanning-tree propagated poses
+Pose corrections are linearised around the spanning-forest propagated poses
 (where every tree edge has zero residual).  Variables per non-anchor
 fragment: ``(dx, dy, dtheta)``.  Every Euclidean residual
 ``|r + J @ delta| <= L`` is outer-approximated with a 12-gon
 (``n_d . (r + J delta) <= L`` for 12 evenly spaced unit directions),
 turning feasibility into an LP.
+
+A candidate seam graph may be connected while a DFS *subset* is not: when
+the seam joining two pieces is temporarily unselected, the subset is a
+forest of several components, each with its own anchor and therefore its
+own number of correction variables.  The LP must not couple those
+independent components -- each component's pose correction is free around
+its own anchor.  We therefore number variables over *every* non-anchor
+node of *every* component once, in one global vector, and let each
+component's rows touch only its own columns.  The resulting matrix is
+block-diagonal, so the single LP is exactly the conjunction of the
+independent per-component LPs (and has one uniform row width -- stacking
+per-component rows of differing widths into one array would crash).
 
 Because this is an *outer* approximation (linearised geometry, polygonal
 norm), ``LP infeasible`` guarantees the true problem is infeasible as
@@ -19,7 +31,7 @@ nodes still get the exact Gauss-Newton + rasterised-overlap check.
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 from scipy.optimize import linprog
@@ -36,18 +48,29 @@ J90 = np.array([[0.0, -1.0], [1.0, 0.0]])
 
 
 def lp_relaxation_feasible(subset) -> bool:
-    """Conservative necessary-feasibility LP over one seam subset."""
+    """Conservative necessary-feasibility LP over one seam subset.
+
+    The subset may span several mutually disconnected components; each is
+    anchored at its smallest-id fragment and gets an independent block of
+    correction variables in one block-diagonal LP.
+    """
     if not subset:
         return True
+
+    # One global variable layout: every non-anchor node of every component.
+    col: Dict[str, int] = {}
+    for nodes, _pose, _tree_ids in forest_poses(subset):
+        anchor = nodes[0]
+        for n in nodes:
+            if n != anchor:
+                col[n] = 3 * len(col)
+    nv = 3 * len(col)
 
     A_rows: List[np.ndarray] = []
     b_rows: List[float] = []
 
     for nodes, pose, tree_ids in forest_poses(subset):
-        anchor = nodes[0]
-        free = [n for n in nodes if n != anchor]
-        col = {n: 3 * i for i, n in enumerate(free)}
-        nv = 3 * len(free)
+        comp_set = set(nodes)
 
         def add_cone(constant: np.ndarray, coefs: List[Tuple[str, np.ndarray]],
                      limit: float):
@@ -58,12 +81,12 @@ def lp_relaxation_feasible(subset) -> bool:
                 for fid, M in coefs:
                     c = col.get(fid)
                     if c is not None:
-                        # M is the 2x3 Jacobian block of this residual
+                        # M is the 2x3 Jacobian block of this residual;
+                        # anchors have no columns, their correction is fixed 0.
                         row[c:c + 3] += nxy @ M
                 A_rows.append(row)
                 b_rows.append(limit - float(nxy @ constant))
 
-        comp_set = set(nodes)
         for e in subset:
             if e.a not in comp_set:
                 continue
@@ -106,8 +129,9 @@ def lp_relaxation_feasible(subset) -> bool:
                              e.pose_limit)
 
     if not A_rows:
+        # A single edge per component (a forest): tree poses fit exactly.
         return True
-    res = linprog(np.zeros(len(A_rows[0])),
+    res = linprog(np.zeros(nv),
                   A_ub=np.asarray(A_rows), b_ub=np.asarray(b_rows),
                   bounds=(None, None), method="highs")
     return res.status in (0, 3)  # optimal or unbounded -> feasible
