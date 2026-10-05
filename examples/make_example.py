@@ -4,9 +4,20 @@ Usage:
     python examples/make_example.py            # writes examples/request.json
     python examples/make_example.py --call     # also POSTs to a running server
 
-The request contains three transparent-PNG potsherds (two match along a
-wavy seam, the third is an isolated fragment), scored candidate seams with
-per-seam pose-error and overlap-pixel limits.
+The request contains five transparent-PNG potsherds and five candidate
+seams:
+
+  * shard-A -- shard-B -- shard-C with a shortcut A-C closing a perfectly
+    consistent loop (all three seams fit one common set of poses);
+  * shard-D -- shard-E, an independent seam that only joins the loop group
+    through the candidate graph;
+  * shard-E -- shard-A, a connector whose solid masks overlap by a whole
+    pixel column under the only pose satisfying its point pairs, so the
+    *full* candidate set is infeasible and the exact search has to choose
+    a subset.
+
+The expected answer keeps the closed loop plus the independent seam (two
+clusters) and reports the connector as ``mask_overlap_exceeds_limit``.
 """
 
 from __future__ import annotations
@@ -26,70 +37,69 @@ def png_b64(img_bgra: np.ndarray) -> str:
     return base64.b64encode(buf.tobytes()).decode("ascii")
 
 
-def make_pieces(size=160):
-    """Two irregular shards from one plaque along a wavy cut + one isolated."""
-    H = W = size
-    plaque = np.zeros((H, W, 4), np.uint8)
-    plaque[:, :, :3] = (82, 120, 178)    # terracotta (B, G, R)
-    plaque[:, :, 3] = 255
+def make_tile(color_bgr, size: int = 40) -> np.ndarray:
+    """One solid, slightly rounded transparent tile in its own image frame."""
+    img = np.zeros((size, size, 4), np.uint8)
+    img[:, :, :3] = color_bgr
+    img[:, :, 3] = 255
+    cv2.circle(img, (0, 0), 6, (0, 0, 0, 0), -1)
+    cv2.circle(img, (size - 1, size - 1), 6, (0, 0, 0, 0), -1)
+    return img
 
-    ys = np.arange(H, dtype=np.float64)
-    cut = (W / 2
-           + 12.0 * np.sin(ys / H * 3.0 * np.pi)
-           + 5.0 * np.sin(ys / H * 8.0 * np.pi + 0.7))
-    xA = np.floor(cut).astype(int)
 
-    mA = np.zeros((H, W), bool)
-    for y in range(H):
-        mA[y, :xA[y] + 1] = True
-    imgA_full = np.zeros_like(plaque)
-    imgA_full[mA] = plaque[mA]
+def seam_pairs(ax: float, bx: float, gap: float = 0.0):
+    """Boundary matches: A's right edge at x=ax, B's left edge at x=bx.
 
-    mB = np.zeros((H, W), bool)
-    for y in range(H):
-        mB[y, xA[y] + 1:] = True
-    imgB_full = np.zeros_like(plaque)
-    imgB_full[mB] = plaque[mB]
-
-    # crop each to its occupied bounding box (independent image frames)
-    def crop(img):
-        yy, xx = np.nonzero(img[:, :, 3])
-        return img[yy.min():yy.max() + 1, xx.min():xx.max() + 1], xx.min(), yy.min()
-
-    imgA, ax0, ay0 = crop(imgA_full)
-    imgB, bx0, by0 = crop(imgB_full)
-
-    # Boundary point pairs expressed in each fragment's cropped frame.
-    pairs = []
-    for y in range(12, H - 12, 10):
-        pa = [float(cut[y] - ax0), float(y - ay0)]
-        pb = [float(cut[y] - bx0), float(y - by0)]
-        pairs.append({"a": pa, "b": pb})
-
-    # Isolated third fragment (a small rounded tile).
-    iso = np.zeros((46, 46, 4), np.uint8)
-    cv2.circle(iso, (23, 23), 20, (60, 110, 190, 255), -1)
-
-    return imgA, imgB, iso, pairs
+    With ``gap`` zero the fitted pose places B exactly ``ax - bx`` pixels
+    to the right of A (a vertical column of solid pixels overlaps).
+    """
+    return [{"a": [float(ax), float(y)], "b": [float(bx), float(y - gap)]}
+            for y in range(4, 36, 6)]
 
 
 def build_request():
-    imgA, imgB, iso, pairs = make_pieces()
+    colors = {
+        "shard-A": (140, 110, 70),
+        "shard-B": (150, 120, 80),
+        "shard-C": (160, 130, 90),
+        "shard-D": (90, 120, 150),
+        "shard-E": (100, 130, 160),
+    }
+    fragments = [{"id": fid, "image_base64": png_b64(make_tile(col))}
+                 for fid, col in colors.items()]
+
     return {
-        "fragments": [
-            {"id": "shard-A", "image_base64": png_b64(imgA)},
-            {"id": "shard-B", "image_base64": png_b64(imgB)},
-            {"id": "shard-C", "image_base64": png_b64(iso)},
-        ],
+        "fragments": fragments,
         "seams": [
             {
-                "id": "seam-AB",
-                "fragment_a": "shard-A",
-                "fragment_b": "shard-B",
-                "score": 12.5,
-                "pose_error_limit": 3.0,
-                "overlap_limit": 200,
-                "pairs": pairs,
+                # consistent closed loop: A +39px = B, B +39px = C,
+                # so the shortcut A-C must shift C by 78px.
+                "id": "seam-AB", "fragment_a": "shard-A", "fragment_b": "shard-B",
+                "score": 12.5, "pose_error_limit": 3.0, "overlap_limit": 200,
+                "pairs": seam_pairs(39, 0),
+            },
+            {
+                "id": "seam-BC", "fragment_a": "shard-B", "fragment_b": "shard-C",
+                "score": 12.5, "pose_error_limit": 3.0, "overlap_limit": 200,
+                "pairs": seam_pairs(39, 0),
+            },
+            {
+                "id": "seam-AC", "fragment_a": "shard-A", "fragment_b": "shard-C",
+                "score": 10.0, "pose_error_limit": 3.0, "overlap_limit": 200,
+                "pairs": seam_pairs(78, 0),
+            },
+            # independent seam (its own component while the search runs)
+            {
+                "id": "seam-DE", "fragment_a": "shard-D", "fragment_b": "shard-E",
+                "score": 8.0, "pose_error_limit": 3.0, "overlap_limit": 200,
+                "pairs": seam_pairs(39, 0),
+            },
+            # connector: pose-consistent, but its 1px-wide overlap column
+            # (40 solid px) violates overlap_limit = 0.
+            {
+                "id": "seam-EA", "fragment_a": "shard-E", "fragment_b": "shard-A",
+                "score": 6.0, "pose_error_limit": 3.0, "overlap_limit": 0,
+                "pairs": seam_pairs(39, 0),
             },
         ],
     }

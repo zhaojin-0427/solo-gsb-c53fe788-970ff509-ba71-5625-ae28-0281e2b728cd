@@ -133,6 +133,65 @@ def test_rejected_seam_does_not_join_clusters():
         "mask_overlap_exceeds_limit"
 
 
+def test_multi_cluster_relaxation_during_subset_search():
+    """Regression: cyclic component + disjoint seam must not crash the LP.
+
+    The candidate graph is connected overall, but the *full* set is
+    infeasible (connector ``ea`` overlaps the solid masks), so the exact
+    search enumerates subsets.  The tentative set {ab, bc, ac, de} holds a
+    three-fragment closed-loop component (two anchor-relative fragments)
+    together with a still-disjoint two-fragment seam (one anchor-relative
+    fragment).  Building one merged LP from rows of differing widths used
+    to raise ``ValueError: ... inhomogeneous shape`` and the API returned
+    a 500 instead of the assembly.
+    """
+    A = _square((90, 120, 200))
+    B = _square((110, 130, 210))
+    C = _square((130, 140, 220))
+    D = _square((70, 100, 180))
+    E = _square((50, 90, 160))
+
+    def pairs(ax, bx, gap):
+        return [([ax, float(y)], [bx, float(y - gap)])
+                for y in range(4, 36, 6)]
+
+    body = {
+        "fragments": [fragment_payload("A", A), fragment_payload("B", B),
+                      fragment_payload("C", C), fragment_payload("D", D),
+                      fragment_payload("E", E)],
+        "seams": [
+            # perfectly consistent loop: shifts 39 + 39 == shortcut 78
+            seam_payload("ab", "A", "B", pairs(39, 0, 0), 8, 3.0, 10**9),
+            seam_payload("bc", "B", "C", pairs(39, 0, 0), 8, 3.0, 10**9),
+            seam_payload("ac", "A", "C", pairs(78, 0, 0), 9, 3.0, 10**9),
+            # independent seam (a second component while searching)
+            seam_payload("de", "D", "E", pairs(39, 0, 0), 7, 3.0, 10**9),
+            # connector: pose-consistent but one overlapping mask column
+            seam_payload("ea", "E", "A", pairs(39, 0, 0), 6, 3.0, 0),
+        ],
+    }
+    r = client.post("/assemblies", json=body)
+    assert r.status_code == 200, r.text
+    js = r.json()
+
+    # Highest-score feasible set: the closed loop (25) plus de (7);
+    # the connector cannot join the groups (overlap 40px > 0).
+    assert js["adopted_seam_ids"] == ["ab", "ac", "bc", "de"]
+    assert js["total_score"] == 32.0
+    assert [c["fragment_ids"] for c in js["clusters"]] == [
+        ["A", "B", "C"], ["D", "E"]]
+    rejected = {s["id"]: s for s in js["rejected_seams"]}
+    assert rejected["ea"]["reason"] == "mask_overlap_exceeds_limit"
+
+    # Both clusters render to valid transparent PNGs under one pose set.
+    for cl in js["clusters"]:
+        img = cv2.imdecode(
+            np.frombuffer(base64.b64decode(cl["image_base64"]), np.uint8),
+            cv2.IMREAD_UNCHANGED)
+        assert img.ndim == 3 and img.shape[2] == 4
+        assert img[:, :, 3].max() == 255
+
+
 def test_unknown_fragment_reference_is_422():
     d = make_shard_pair(seed=11)
     body = {

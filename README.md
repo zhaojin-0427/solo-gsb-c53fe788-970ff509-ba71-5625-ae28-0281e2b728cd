@@ -90,8 +90,8 @@ pytest -q
       "pose_error_limit": 3.0,                // 点对残差/闭环误差上限（像素）
       "overlap_limit": 200,                   // 实体掩膜重叠像素上限
       "pairs": [                              // 至少 2 对，且不能退化（共点）
-        {"a": [71.0, 12.0], "b": [3.0, 12.0]},
-        {"a": [72.4, 22.0], "b": [4.4, 22.0]}
+        {"a": [39.0, 4.0], "b": [0.0, 4.0]},
+        {"a": [39.0, 10.0], "b": [0.0, 10.0]}
       ]
     }
   ]
@@ -112,17 +112,26 @@ y 向下）。点对 `a`、`b` 分别是边界点在 `fragment_a`、`fragment_b`
 
 ---
 
-## 4. 实际请求与响应示例
+## 4. 实际请求与响应示例（多簇 + 闭环 + 淘汰）
 
 仓库自带一个可直接生成真实请求并调用服务的脚本：
 
 ```bash
-# 1) 生成 examples/request.json（3 张透明 PNG：两片可拼合 + 一片孤立）
+# 1) 生成 examples/request.json
+#    5 张透明 PNG：A-B-C 一致闭环 + 独立接缝 D-E + 连接缝 E-A
 python examples/make_example.py
 
 # 2) 对正在运行的服务发起真实 POST，落地 examples/response.json 与渲染 PNG
 python examples/make_example.py --call
 ```
+
+示例候选图整体连通：`A-B-C-A` 是一条**一致闭环**（AB、BC 各平移 39px，
+捷径 AC 平移 78px，三者共用一组全局位姿且残差/闭环误差为 0）；`D-E` 是
+另一条独立接缝；`E-A` 把两组在候选图层面连起来，但它唯一满足点对的位姿
+会让两片实体掩膜重叠 26 像素，而 `overlap_limit = 0`。因此**完整集合不可行**，
+精确搜索在子集空间枚举——搜索过程中临时集合会同时包含“三片闭环簇”和
+“尚未连入的独立接缝”两个连通分量——最终保留闭环（35 分）加独立接缝（8 分），
+以 `mask_overlap_exceeds_limit` 淘汰连接缝，输出两个簇。
 
 或用 curl：
 
@@ -132,52 +141,80 @@ curl -s -X POST http://localhost:8000/assemblies \
   --data @examples/request.json | python -m json.tool
 ```
 
-实际响应（`examples/response.json`；PNG 为真实 Base64，下方截断展示）：
+以下是对本机服务发起真实 POST 得到的响应（`examples/response.json`；
+PNG 为真实 Base64，下方截断展示）：
 
 ```json
 {
   "clusters": [
     {
       "cluster_id": 1,
-      "fragment_ids": ["shard-A", "shard-B"],
+      "fragment_ids": ["shard-A", "shard-B", "shard-C"],
       "poses": [
         {"fragment_id": "shard-A", "theta": 0.0, "tx": 0.0, "ty": 0.0,
          "pair_residual_rms": 0.0, "pair_residual_max": 0.0},
-        {"fragment_id": "shard-B", "theta": 0.0, "tx": 67.0, "ty": 0.0,
+        {"fragment_id": "shard-B", "theta": 0.0, "tx": 39.0, "ty": 0.0,
+         "pair_residual_rms": 0.0, "pair_residual_max": 0.0},
+        {"fragment_id": "shard-C", "theta": 0.0, "tx": 78.0, "ty": 0.0,
          "pair_residual_rms": 0.0, "pair_residual_max": 0.0}
       ],
       "adopted_seams": [
         {"id": "seam-AB", "fragment_a": "shard-A", "fragment_b": "shard-B",
          "score": 12.5, "pair_residual_max": 0.0, "loop_error": 0.0,
-         "overlap_pixels": 0}
+         "overlap_pixels": 26},
+        {"id": "seam-AC", "fragment_a": "shard-A", "fragment_b": "shard-C",
+         "score": 10.0, "pair_residual_max": 0.0, "loop_error": 0.0,
+         "overlap_pixels": 0},
+        {"id": "seam-BC", "fragment_a": "shard-B", "fragment_b": "shard-C",
+         "score": 12.5, "pair_residual_max": 0.0, "loop_error": 0.0,
+         "overlap_pixels": 26}
       ],
       "rejected_seams": [],
-      "total_score": 12.5,
-      "image_base64": "iVBORw0KGgoAAAANSUhEUgAAAK8AAACvCAYAAACLko51AAAG...（透明 PNG）"
+      "total_score": 35.0,
+      "image_base64": "iVBORw0KGgoAAAANSUhEUgAAAIUAAAA3CAYAAAAi2IlCAAAD...（透明 PNG）"
     },
     {
       "cluster_id": 2,
-      "fragment_ids": ["shard-C"],
+      "fragment_ids": ["shard-D", "shard-E"],
       "poses": [
-        {"fragment_id": "shard-C", "theta": 0.0, "tx": 0.0, "ty": 0.0,
+        {"fragment_id": "shard-D", "theta": 0.0, "tx": 0.0, "ty": 0.0,
+         "pair_residual_rms": 0.0, "pair_residual_max": 0.0},
+        {"fragment_id": "shard-E", "theta": 0.0, "tx": 39.0, "ty": 0.0,
          "pair_residual_rms": 0.0, "pair_residual_max": 0.0}
       ],
-      "adopted_seams": [],
-      "rejected_seams": [],
-      "total_score": 0.0,
-      "image_base64": "iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAAB...（透明 PNG）"
+      "adopted_seams": [
+        {"id": "seam-DE", "fragment_a": "shard-D", "fragment_b": "shard-E",
+         "score": 8.0, "pair_residual_max": 0.0, "loop_error": 0.0,
+         "overlap_pixels": 26}
+      ],
+      "rejected_seams": [
+        {"id": "seam-EA", "fragment_a": "shard-E", "fragment_b": "shard-A",
+         "score": 6.0, "reason": "mask_overlap_exceeds_limit",
+         "pair_residual_max": 0.0, "loop_error": 0.0, "overlap_pixels": 26}
+      ],
+      "total_score": 8.0,
+      "image_base64": "iVBORw0KGgoAAAANSUhEUgAAAF4AAAA3CAYAAACFKf38AAAC...（透明 PNG）"
     }
   ],
-  "adopted_seam_ids": ["seam-AB"],
-  "rejected_seams": [],
-  "total_score": 12.5
+  "adopted_seam_ids": ["seam-AB", "seam-AC", "seam-BC", "seam-DE"],
+  "rejected_seams": [
+    {"id": "seam-EA", "reason": "mask_overlap_exceeds_limit",
+     "pair_residual_max": 0.0, "loop_error": 0.0, "overlap_pixels": 26}
+  ],
+  "total_score": 43.0
 }
 ```
 
 `--call` 还会把每个簇按同一位姿渲染的透明 PNG 写到
 `examples/cluster_1.png`、`examples/cluster_2.png`，可直接打开查看：
-`cluster_1.png` 是两片陶片在统一全局位姿下拼回的完整陶板，`cluster_2.png`
-是孤立的第三片。
+`cluster_1.png` 是三片陶片在统一全局位姿下拼回的闭环，`cluster_2.png`
+是由独立接缝拼合的两片；被淘汰的连接缝**不会**把两组画到同一张图里。
+
+> **多簇子集的松弛怎么算？** 搜索树节点上的临时接缝集合可能还是一片
+> “森林”（例如闭环 + 一条尚未连入的接缝）。各连通分量不共享片段，
+> 位姿修正变量彼此独立，因此松弛对**每个连通分量分别建一个 LP**
+> （等价于在统一变量空间里求解一个块对角约束矩阵的 LP），全部可行
+> 才算可行。这保证剪枝仍是可靠的必要性判据，绝不会误删可行集合。
 
 ### 淘汰接缝的原因码（`reason`）
 
@@ -201,7 +238,7 @@ curl -s -X POST http://localhost:8000/assemblies \
 app/
   geometry.py    闭式刚体（旋转+平移）拟合、位姿复合/相对位姿
   posegraph.py   生成树初始化 + 全局 Gauss–Newton 位姿图求解（所有接缝同时拟合）
-  relax.py       位姿可行性的 LP 松弛（单调性、可靠剪枝）
+  relax.py       位姿可行性的 LP 松弛（按连通分量分簇建 LP，单调性、可靠剪枝）
   masks.py       alpha 掩膜、相对位姿下的实体重叠计数、透明 PNG 渲染
   assembler.py   解码/建模、可行性判定、分支限界精确全局选缝
   service.py     端到端编排：成簇、采用/淘汰归因、渲染与响应
