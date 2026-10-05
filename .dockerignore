@@ -1,0 +1,10 @@
+.git/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+tests/
+examples/request.json
+examples/response.json
+examples/cluster_*.png
+README.md
